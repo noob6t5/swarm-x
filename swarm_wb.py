@@ -16,9 +16,11 @@ from datetime import datetime, timezone
 from collections import defaultdict, Counter
 
 ## Basic part of  Scanner with Infotaxis Agent for Monitoring Large Industrial based Web Applications
-## 
+##  Major Feauteres are still missing :))
 
-# --- CONFIGURATION ---
+
+
+#CONFIGURATION Just for testing purposes in internal network thing's would be different
 OUTPUT_DIR = "output"
 MAX_AGENTS = 5
 CONCURRENT_REQUESTS = 10
@@ -41,9 +43,9 @@ WEIGHTS = {
     "js": 1.0,
     "fuzz": 4.0,
 }
-FUZZ_LENGTH_THRESHOLD = 50  # bytes difference to count as real fuzz hit
+FUZZ_LENGTH_THRESHOLD = 50  # bytes difference to count as real fuzz hit as it's still not the great method :) for simplicty i did it
 
-# Runtime globals
+#  globals 
 ALLOWED_DOMAIN = None
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 agent_semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
@@ -56,7 +58,6 @@ shared = {
     "fuzzed_urls": set(),
 }
 
-
 # --- UTILS ---
 def shannon_entropy(s: str) -> float:
     freq = Counter(s)
@@ -67,8 +68,7 @@ def shannon_entropy(s: str) -> float:
         else 0.0
     )
 
-
-# --- SCANNERS ---
+# --- SCANNERS ---  swarns  !!!!! 
 def scan_secrets(text: str):
     leaks = []
     patterns = {
@@ -82,7 +82,7 @@ def scan_secrets(text: str):
             leaks.append((name, m))
     return leaks
 
-
+# json strcutues 
 def scan_json_structure(text: str):
     try:
         o = json.loads(text)
@@ -103,7 +103,7 @@ def scan_json_structure(text: str):
     return any(k.lower() in ("password", "secret", "token", "apikey") for k in keys)
 
 
-# --- LINK HANDLING ---
+# link in csv
 def extract_links(html: str, base: str):
     soup = BeautifulSoup(html, "html.parser")
     links = set()
@@ -132,7 +132,7 @@ async def fetch(session, url: str):
             return None, "", {}, 0
 
 
-# --- RECON AGENT ---
+#RECON AGENT lmo 
 async def agent(name: str, start: str, depth_limit: int):
     queue = [(start, 0)]
     async with aiohttp.ClientSession() as ses:
@@ -146,7 +146,8 @@ async def agent(name: str, start: str, depth_limit: int):
             if status != 200 or not body:
                 continue
 
-            # Leak scanning
+            #  scanning 
+            #  Belo2 scanning features are not the best and still need to be improved esp for large corp. 
             leaks = scan_secrets(body)
             if scan_json_structure(body):
                 leaks.append(("JSON", "struct"))
@@ -238,7 +239,6 @@ async def agent(name: str, start: str, depth_limit: int):
                 queue.append((link, depth + 1))
 
 
-# --- MAIN ---
 async def main(tgt: str, agents: int, depth: int):
     global ALLOWED_DOMAIN
     if not tgt.startswith("http"):
@@ -257,7 +257,7 @@ async def main(tgt: str, agents: int, depth: int):
             w.writerow([u, sc, ";".join(ls), ";".join(fs)])
     print("CSV->", csvf)
 
-    # Heatmap
+    # Heatmap for URLs ,
     segs = defaultdict(list)
     for u, sc in shared["url_scores"].items():
         parts = urlparse(u).path.split("/")
@@ -288,3 +288,6 @@ if __name__ == "__main__":
     p.add_argument("--depth", type=int, default=DEPTH_LIMIT)
     a = p.parse_args()
     asyncio.run(main(a.target, a.agents, a.depth))
+
+## Todo 
+# 1. Refactor the code to make it more modular and readable as well remove recurring Fuzzing

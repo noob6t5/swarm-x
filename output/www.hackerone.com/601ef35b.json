@@ -1,0 +1,7 @@
+{
+  "url": "https://www.hackerone.com/modules/contrib/google_tag/js/gtm.js",
+  "score": 14.880032365461703,
+  "leaks": [],
+  "fuzz_hits": [],
+  "time": 0.030419349670410156
+}

