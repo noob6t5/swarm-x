@@ -1,297 +1,290 @@
 import aiohttp
 import asyncio
 import hashlib
-import re
 import math
+import re
 import json
+import random
 import argparse
 import os
+import time
+import csv
+import matplotlib.pyplot as plt
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-from datetime import datetime
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode
+from datetime import datetime, timezone
+from collections import defaultdict, Counter
 
-visited = set()
-entropy_map = {}
+## Basic part of  Scanner with Infotaxis Agent for Monitoring Large Industrial based Web Applications
+## 
+
+# --- CONFIGURATION ---
 OUTPUT_DIR = "output"
+MAX_AGENTS = 5
+CONCURRENT_REQUESTS = 10
+DEPTH_LIMIT = 5
+FUZZ_PAYLOADS = [
+    "<script>alert(1)</script>",
+    "' OR '1'='1;--",
+    "../../../../etc/passwd",
+    "../.env",
+    "<img src=x onerror=alert(1)>",
+    "?debug=true",
+    "?admin=1",
+]
+KEYWORDS = ["admin", "login", "token", "key", "secret", "api"]
+WEIGHTS = {
+    "entropy": 2.0,
+    "keyword": 3.0,
+    "leak": 5.0,
+    "form": 2.0,
+    "js": 1.0,
+    "fuzz": 4.0,
+}
+FUZZ_LENGTH_THRESHOLD = 50  # bytes difference to count as real fuzz hit
 
-if not os.path.exists(OUTPUT_DIR):
-    os.makedirs(OUTPUT_DIR)
+# Runtime globals
+ALLOWED_DOMAIN = None
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+agent_semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
+shared = {
+    "visited_urls": set(),
+    "url_scores": {},
+    "leaks_found": [],
+    "fuzz_success": Counter(),
+    "domains": set(),
+    "fuzzed_urls": set(),
+}
 
-## For further development, please refer to the following: You can PR to the repo,
-## Here I just provided the basic working principle of  infotaxis algorithm  and How it can be benefical for Large Industrial Purpose.
 
-# --- ENTROPY ---
-def shannon_entropy(s):
-    freq = {}
-    for c in s:
-        freq[c] = freq.get(c, 0) + 1
+# --- UTILS ---
+def shannon_entropy(s: str) -> float:
+    freq = Counter(s)
     total = len(s)
     return (
-        -sum((f / total) * math.log2(f / total) for f in freq.values()) if total else 0
+        -sum((f / total) * math.log2(f / total) for f in freq.values())
+        if total
+        else 0.0
     )
 
-def calc_entropy_gain(data):
-    h = hashlib.sha256(data.encode()).hexdigest()
-    if h in entropy_map:
-        return 0
-    e = shannon_entropy(data)
-    entropy_map[h] = e
-    return e
 
-# --- LEAK SCANNER --- I just used simple regex for the demo purpose, in real indutrial purpose,
-# If you are taking this and developing for your own Industry i would suggest to use  ML based approach to detect the leaks acc to service used.
-def scan_for_secrets(text):
+# --- SCANNERS ---
+def scan_secrets(text: str):
     leaks = []
-    regexes = {
-        "AWS Access Key": r"AKIA[0-9A-Z]{16}",
-        "Google API Key": r"AIza[0-9A-Za-z-_]{35}",
-        "Slack Token": r"xox[baprs]-[0-9a-zA-Z]{10,48}",
-        "Stripe Key": r"sk_live_[0-9a-zA-Z]{24}",
-        "Bearer Token": r"Bearer\s+[A-Za-z0-9\-_.=]+",
-        "JWT": r"eyJ[a-zA-Z0-9-_]+\.[a-zA-Z0-9-_]+\.[a-zA-Z0-9-_]+",
-        "Basic Auth": r"Authorization:\s*Basic\s+[A-Za-z0-9+/=]+",
-        "Generic token": r"token\s*[:=]\s*['\"][a-zA-Z0-9\-_\.]{10,}['\"]",
+    patterns = {
+        "AWS": r"AKIA[0-9A-Z]{16}",
+        "GoogleAPI": r"AIza[0-9A-Za-z-_]{35}",
+        "JWT": r"eyJ[\w-]+\.[\w-]+\.[\w-]+",
+        "Bearer": r"Bearer\s+[A-Za-z0-9\-_.=]+",
     }
-    for name, pattern in regexes.items():
-        found = [str(x) for x in re.findall(pattern, text)]
-        if found:
-            leaks.append((name, found))
+    for name, pat in patterns.items():
+        for m in re.findall(pat, text):
+            leaks.append((name, m))
     return leaks
 
-# --- FORM SCANNER ---
-def scan_for_forms(html):
-    soup = BeautifulSoup(html, "html.parser")
-    forms = soup.find_all("form")
-    results = []
-    for f in forms:
-        action = f.get("action", "")
-        method = f.get("method", "GET")
-        inputs = [inp.get("name", "") for inp in f.find_all("input")]
-        results.append({"action": action, "method": method, "inputs": inputs})
-    return results
 
-# --- API SCANNER ---
-def scan_for_json_api(text, url):
-    return (
-        url.endswith(".json")
-        or "application/json" in text
-        or bool(re.search(r'{\s*".+?"\s*:', text))
-    )
+def scan_json_structure(text: str):
+    try:
+        o = json.loads(text)
+    except:
+        return False
+    keys = []
 
-# --- LINK EXTRACT -
-def extract_links(html, base_url):
+    def traverse(x):
+        if isinstance(x, dict):
+            for k, v in x.items():
+                keys.append(k)
+                traverse(v)
+        elif isinstance(x, list):
+            for e in x:
+                traverse(e)
+
+    traverse(o)
+    return any(k.lower() in ("password", "secret", "token", "apikey") for k in keys)
+
+
+# --- LINK HANDLING ---
+def extract_links(html: str, base: str):
     soup = BeautifulSoup(html, "html.parser")
     links = set()
     for tag in soup.find_all(["a", "script", "link", "iframe"]):
         href = tag.get("href") or tag.get("src")
-        if href:
-            link = urljoin(base_url, href)
-            parsed = urlparse(link)
-            clean = parsed.scheme + "://" + parsed.netloc + parsed.path
-            if clean not in visited:
-                links.add(clean)
+        if not href:
+            continue
+        u = urljoin(base, href)
+        p = urlparse(u)
+        shared["domains"].add(p.netloc)
+        if ALLOWED_DOMAIN and not p.netloc.endswith(ALLOWED_DOMAIN):
+            continue
+        links.add(f"{p.scheme}://{p.netloc}{p.path}")
     return links
 
-# --- FETCH PAGE ---
-async def fetch(session, url):
-    try:
-        async with session.get(url, timeout=10) as r:
-            content_type = r.headers.get("Content-Type", "")
+
+# --- FETCH ---
+async def fetch(session, url: str):
+    async with agent_semaphore:
+        start = time.time()
+        try:
+            r = await session.get(url, timeout=10)
             text = await r.text(errors="ignore")
-            return text, content_type
-    except Exception as e:
-        print(f"[!] Failed to fetch {url} :: {e}")
-        return "", ""
-
-# --- SAVE ---
-# I am quit lazy to format it, so i just used the basic json format,
-# In real world, you can use the database to store the data and then use it for analysis.
-def save_output(url, leaks, entropy, forms, is_api):
-    ts = datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-    safe_url = url.replace("://", "_").replace("/", "_").replace("?", "_")
-    file_path = os.path.join(OUTPUT_DIR, f"{ts}_{safe_url}.json")
-    try:
-        json.dump(
-            {
-                "url": url,
-                "entropy": entropy,
-                "leaks": leaks,
-                "forms": forms,
-                "api": is_api,
-            },
-            open(file_path, "w"),
-            indent=2,
-        )
-    except Exception as e:
-        print(f"[!] JSON write failed for {url}: {e}")
-
-# --- SWARM (Infotaxis) ---
-async def infotaxis_smart_recon(start_url, max_depth=5):
-    frontier = {start_url}
-    async with aiohttp.ClientSession() as session:
-        for depth in range(max_depth):
-            print(f"\n🔥 Depth {depth} | Targets: {len(frontier)}")
-            scored = []
-
-            for url in list(frontier):
-                if url in visited:
-                    continue
-                visited.add(url)
-
-                html, content_type = await fetch(session, url)
-                gain = calc_entropy_gain(html)
-
-                leaks = scan_for_secrets(html)
-                if leaks:
-                    print(f"🚨 LEAKS FOUND @ {url}")
-                    for ltype, vals in leaks:
-                        print(f"   - {ltype}: {vals}")
-
-                forms = scan_for_forms(html)
-                if forms:
-                    print(f"[+] {len(forms)} forms found @ {url}")
-
-                is_api = scan_for_json_api(html, url)
-                if is_api:
-                    print(f"[+] API detected @ {url}")
-
-                save_output(url, leaks, gain, forms, is_api)
-                links = extract_links(html, url)
-
-                scored.append((gain, links, url))
-
-            scored.sort(reverse=True, key=lambda x: x[0])  # infotaxis priority
-            frontier = set()
-            for gain, links, src_url in scored[:5]:
-                print(f"[~] Entropy: {gain:.2f} :: {src_url}")
-                frontier.update(links)
-
-            if not frontier:
-                print("[-] No more links. Swarm complete.")
-                break
-
-# --- LEARNING SCORING ENGINE ---Randomly added the score's Adjust plz:)
-learning_db = {
-    "tags": {
-        "aws-key": 6,
-        "token": 5,
-        "secrets-exposed": 7,
-        "api-key": 4,
-        "form-zone": 3,
-        "api-endpoint": 5,
-        "high-entropy": 2,
-        "js-payload-zone": 4,
-    },
-    "boost_patterns": {
-        "/admin": 3,
-        "/reset": 2,
-        "/callback": 2,
-        "/token": 2,
-        ".env": 5,
-    },
-}
+            return r.status, text, r.headers, time.time() - start
+        except:
+            return None, "", {}, 0
 
 
-def run_infotaxis_analyzer(output_dir="output"):
-    from collections import defaultdict
-    import matplotlib.pyplot as plt
+# --- RECON AGENT ---
+async def agent(name: str, start: str, depth_limit: int):
+    queue = [(start, 0)]
+    async with aiohttp.ClientSession() as ses:
+        while queue:
+            url, depth = queue.pop(0)
+            if depth > depth_limit or url in shared["visited_urls"]:
+                continue
+            shared["visited_urls"].add(url)
 
-    cluster = defaultdict(list)
-    scores = []
-
-    for root, dirs, files in os.walk(output_dir):
-        for f in files:
-            if not f.endswith(".json"):
+            status, body, hdrs, lat = await fetch(ses, url)
+            if status != 200 or not body:
                 continue
 
-            path = os.path.join(root, f)
-            try:
-                with open(path) as jf:
-                    data = json.load(jf)
+            # Leak scanning
+            leaks = scan_secrets(body)
+            if scan_json_structure(body):
+                leaks.append(("JSON", "struct"))
 
-                url = data.get("url", "unknown")
-                entropy = data.get("entropy", 0)
-                leaks = data.get("leaks", [])
-                forms = data.get("forms", [])
-                is_api = data.get("api", False)
+            # Fuzz GET params
+            fuzz_hits = 0
+            fuzz_details = []
+            if url not in shared["fuzzed_urls"]:
+                p = urlparse(url)
+                qs = parse_qs(p.query)
+                for k in qs:
+                    pl = random.choice(FUZZ_PAYLOADS)
+                    mutated = p._replace(query=urlencode({k: pl}, doseq=True)).geturl()
+                    st2, b2, _, _ = await fetch(ses, mutated)
+                    if st2 == 200 and abs(len(b2) - len(body)) > FUZZ_LENGTH_THRESHOLD:
+                        fuzz_hits += 1
+                        shared["fuzz_success"][pl] += 1
+                        fuzz_details.append((k, pl))
+                        print(f"[FUZZ-GET] {mutated}")
+                shared["fuzzed_urls"].add(url)
 
-                tags = []
+            # Fuzz POST forms
+            soup = BeautifulSoup(body, "html.parser")
+            for form in soup.find_all("form"):
+                action = form.get("action") or url
+                action = urljoin(url, action)
+                method = form.get("method", "get").lower()
+                inputs = [
+                    inp.get("name") for inp in form.find_all("input") if inp.get("name")
+                ]
+                for inp_name in inputs:
+                    for pl in FUZZ_PAYLOADS:
+                        if method == "post":
+                            r2 = await ses.post(action, data={inp_name: pl})
+                        else:
+                            r2 = await ses.get(action, params={inp_name: pl})
+                        t2 = await r2.text(errors="ignore")
+                        if (
+                            r2.status == 200
+                            and abs(len(t2) - len(body)) > FUZZ_LENGTH_THRESHOLD
+                        ):
+                            fuzz_hits += 1
+                            shared["fuzz_success"][pl] += 1
+                            fuzz_details.append((f"form:{inp_name}", pl))
+                            print(f"[FUZZ-POST] {action} {inp_name}={pl}")
 
-                if leaks:
-                    for l in leaks:
-                        ltype = l[0].lower()
-                        if "aws" in ltype:
-                            tags.append("aws-key")
-                        if "bearer" in ltype:
-                            tags.append("token")
-                        if "secret" in ltype:
-                            tags.append("secrets-exposed")
-                        if "api" in ltype:
-                            tags.append("api-key")
+            # Scoring
+            e = shannon_entropy(body)
+            drift = abs(e - shannon_entropy(""))
+            score = (
+                drift * WEIGHTS["entropy"]
+                + len(leaks) * WEIGHTS["leak"]
+                + sum(body.lower().count(k) for k in KEYWORDS) * WEIGHTS["keyword"]
+                + body.count("<form") * WEIGHTS["form"]
+                + body.count(".js") * WEIGHTS["js"]
+                + fuzz_hits * WEIGHTS["fuzz"]
+            )
+            shared["url_scores"][url] = max(shared["url_scores"].get(url, 0), score)
 
-                if forms:
-                    tags.append("form-zone")
-                if is_api:
-                    tags.append("api-endpoint")
-                if entropy > 5:
-                    tags.append("high-entropy")
-                if any("callback" in ltype or "token" in ltype for ltype, _ in leaks):
-                    tags.append("js-payload-zone")
+            # Record leaks
+            for ln, val in leaks:
+                if (url, ln, val) not in shared["leaks_found"]:
+                    shared["leaks_found"].append((url, ln, val))
 
-                score = sum(learning_db["tags"].get(tag, 0) for tag in tags)
+            # Save JSON per-domain
+            d = urlparse(url).netloc
+            od = os.path.join(OUTPUT_DIR, d)
+            os.makedirs(od, exist_ok=True)
+            fn = hashlib.sha1(url.encode()).hexdigest()[:8] + ".json"
+            with open(os.path.join(od, fn), "w") as f:
+                json.dump(
+                    {
+                        "url": url,
+                        "score": score,
+                        "leaks": leaks,
+                        "fuzz_hits": fuzz_details,
+                        "time": lat,
+                    },
+                    f,
+                    indent=2,
+                )
 
-                for pattern, boost in learning_db["boost_patterns"].items():
-                    if pattern in url:
-                        score += boost
-                        tags.append(f"boost:{pattern}")
+            print(
+                f"[{name}] D{depth}|{url}|S:{score:.1f}|L:{len(leaks)}|F:{fuzz_hits}|t:{lat:.2f}s"
+            )
 
-                scores.append((score, url, tags))
-                base = url.split("/")[3] if len(url.split("/")) > 3 else "/"
-                cluster[base].append(score)
-
-            except Exception as e:
-                print(f"[!] Failed to process {path}: {e}")
-
-    scores.sort(reverse=True, key=lambda x: x[0])
-
-    print("\n💥 ADVANCED INFOTAXIS OUTPUT ANALYSIS 💥")
-    for score, url, tags in scores:
-        print(f"[{score:02d}] {url} :: {' | '.join(tags)}")
-
-    # CLUSTER VISUALIZATION
-    try:
-        plt.figure(figsize=(12, 5))
-        keys = list(cluster.keys())
-        vals = [sum(v) / len(v) for v in cluster.values()]
-        plt.bar(keys, vals)
-        plt.xticks(rotation=45, ha="right")
-        plt.title("🔥 Recon Heatmap: Endpoint Clusters by Average Score")
-        plt.tight_layout()
-        heatmap_file = os.path.join(output_dir, "heatmap.png")
-        plt.savefig(heatmap_file)
-        print(f"\n[+] Heatmap saved to {heatmap_file}")
-    except Exception as e:
-        print(f"[!] Heatmap failed: {e}")
+            # Enqueue children
+            for link in extract_links(body, url):
+                queue.append((link, depth + 1))
 
 
-# --- CLI ENTRY ---
+# --- MAIN ---
+async def main(tgt: str, agents: int, depth: int):
+    global ALLOWED_DOMAIN
+    if not tgt.startswith("http"):
+        tgt = "http://" + tgt
+    ALLOWED_DOMAIN = urlparse(tgt).netloc
+    await asyncio.gather(*[agent(f"A{i+1}", tgt, depth) for i in range(agents)])
+
+    # SummaryCSV  urls is here grep for further processing
+    csvf = os.path.join(OUTPUT_DIR, "summary.csv")
+    with open(csvf, "w", newline="") as cf:
+        w = csv.writer(cf)
+        w.writerow(["url", "score", "leaks", "fuzz_hits"])
+        for u, sc in shared["url_scores"].items():
+            ls = [f"{ln}:{v}" for (uu, ln, v) in shared["leaks_found"] if uu == u]
+            fs = [f"{k}({c})" for k, c in shared["fuzz_success"].items()]
+            w.writerow([u, sc, ";".join(ls), ";".join(fs)])
+    print("CSV->", csvf)
+
+    # Heatmap
+    segs = defaultdict(list)
+    for u, sc in shared["url_scores"].items():
+        parts = urlparse(u).path.split("/")
+        seg = parts[1] if len(parts) > 1 and parts[1] else "root"
+        segs[seg].append(sc)
+    keys = list(segs.keys())
+    vals = [sum(v) / len(v) for v in segs.values()]
+    plt.figure()
+    plt.bar(keys, vals)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    hp = os.path.join(OUTPUT_DIR, "heatmap.png")
+    plt.savefig(hp)
+    print("Heatmap->", hp)
+
+    # Domains
+    domf = os.path.join(OUTPUT_DIR, "domains.txt")
+    with open(domf, "w") as df:
+        for d in sorted(shared["domains"]):
+            df.write(d + "\n")
+    print("Domains->", domf)
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="🔥 Infotaxis Recon")
-    parser.add_argument(
-        "--analyze-only", action="store_true", help="Run analysis only on saved output"
-    )
-    parser.add_argument("--depth", type=int, default=5, help="Set depth for crawling")
-    args = parser.parse_args()
-
-    if args.analyze_only:
-        print("🔍 Analyzing existing output folder only...")
-        run_infotaxis_analyzer(OUTPUT_DIR)
-        exit(0)
-
-    print("Swarm Recon Tool Demo For Industrial Purpose using Infotaxis based Algorithm")
-    target = input("Enter target URL (e.g. https://example.com): ").strip()
-    if not target.startswith("http"):
-        target = "https://" + target
-    asyncio.run(infotaxis_smart_recon(target, max_depth=args.depth))
-    print("\n🔎 Running final output analysis...")
-    run_infotaxis_analyzer(OUTPUT_DIR)
+    p = argparse.ArgumentParser()
+    p.add_argument("target")
+    p.add_argument("--agents", type=int, default=MAX_AGENTS)
+    p.add_argument("--depth", type=int, default=DEPTH_LIMIT)
+    a = p.parse_args()
+    asyncio.run(main(a.target, a.agents, a.depth))
