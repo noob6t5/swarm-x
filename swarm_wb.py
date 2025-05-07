@@ -4,62 +4,58 @@ import hashlib
 import math
 import re
 import json
-import random
-import argparse
 import os
 import time
-import csv
-import matplotlib.pyplot as plt
+import signal
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode
-from datetime import datetime, timezone
+from urllib.parse import urljoin, urlparse, parse_qs
 from collections import defaultdict, Counter
 
-## Basic part of  Scanner with Infotaxis Agent for Monitoring Large Industrial based Web Applications
-##  Major Feauteres are still missing :))
-
-
-
-#CONFIGURATION Just for testing purposes in internal network thing's would be different
-OUTPUT_DIR = "output"
+# --- CONFIGURATION ---
 MAX_AGENTS = 5
 CONCURRENT_REQUESTS = 10
 DEPTH_LIMIT = 5
-FUZZ_PAYLOADS = [
-    "<script>alert(1)</script>",
-    "' OR '1'='1;--",
-    "../../../../etc/passwd",
-    "../.env",
-    "<img src=x onerror=alert(1)>",
-    "?debug=true",
-    "?admin=1",
-]
 KEYWORDS = ["admin", "login", "token", "key", "secret", "api"]
-WEIGHTS = {
-    "entropy": 2.0,
-    "keyword": 3.0,
-    "leak": 5.0,
-    "form": 2.0,
-    "js": 1.0,
-    "fuzz": 4.0,
-}
-FUZZ_LENGTH_THRESHOLD = 50  # bytes difference to count as real fuzz hit as it's still not the great method :) for simplicty i did it
+WEIGHTS = {"entropy": 2.0, "keyword": 3.0, "leak": 5.0, "form": 2.0, "js": 1.0}
 
-#  globals 
+# Globals
 ALLOWED_DOMAIN = None
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-agent_semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
 shared = {
     "visited_urls": set(),
     "url_scores": {},
     "leaks_found": [],
-    "fuzz_success": Counter(),
+    "scores_history": defaultdict(list),
     "domains": set(),
-    "fuzzed_urls": set(),
 }
+agent_semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
+
+# --- MEMORY SYSTEM ---
+INTEL_DIR = "intel"
+KNOWN_JS_PATHS_FILE = os.path.join(INTEL_DIR, "known-js-paths.json")
+API_HINTS_FILE = os.path.join(INTEL_DIR, "api-hints.json")
+
+os.makedirs(INTEL_DIR, exist_ok=True)
+
+
+def load_json(path):
+    if not os.path.exists(path):
+        with open(path, "w") as f:
+            json.dump({}, f)
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+known_js_paths = load_json(KNOWN_JS_PATHS_FILE)
+api_hints = load_json(API_HINTS_FILE)
+
 
 # --- UTILS ---
-def shannon_entropy(s: str) -> float:
+def shannon_entropy(s):
     freq = Counter(s)
     total = len(s)
     return (
@@ -68,226 +64,193 @@ def shannon_entropy(s: str) -> float:
         else 0.0
     )
 
-# --- SCANNERS ---  swarns  !!!!! 
-def scan_secrets(text: str):
+
+def entropy_drift(e1, e2):
+    return abs(e2 - e1)
+
+
+def scan_secrets(text, source_url=None):
     leaks = []
     patterns = {
         "AWS": r"AKIA[0-9A-Z]{16}",
         "GoogleAPI": r"AIza[0-9A-Za-z-_]{35}",
         "JWT": r"eyJ[\w-]+\.[\w-]+\.[\w-]+",
         "Bearer": r"Bearer\s+[A-Za-z0-9\-_.=]+",
+        "GenericAPI": r"(api[_-]?key|secret|token)[\"'\s:=]{1,5}[a-z0-9-_]{8,40}",
     }
     for name, pat in patterns.items():
-        for m in re.findall(pat, text):
-            leaks.append((name, m))
+        for match in re.findall(pat, text, re.I):
+            leaks.append((name, match))
+            if source_url:
+                api_hints.setdefault(name, [])
+                if source_url not in api_hints[name]:
+                    api_hints[name].append(source_url)
     return leaks
 
-# json strcutues 
-def scan_json_structure(text: str):
+
+def scan_json_keys(text):
     try:
-        o = json.loads(text)
+        obj = json.loads(text)
     except:
-        return False
+        return []
     keys = []
 
-    def traverse(x):
-        if isinstance(x, dict):
-            for k, v in x.items():
+    def traverse(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
                 keys.append(k)
                 traverse(v)
-        elif isinstance(x, list):
-            for e in x:
-                traverse(e)
+        elif isinstance(o, list):
+            for i in o:
+                traverse(i)
 
-    traverse(o)
-    return any(k.lower() in ("password", "secret", "token", "apikey") for k in keys)
+    traverse(obj)
+    return [k for k in keys if k.lower() in ("password", "secret", "token", "apikey")]
 
 
-# link in csv
-def extract_links(html: str, base: str):
+def extract_links(html, base):
     soup = BeautifulSoup(html, "html.parser")
     links = set()
     for tag in soup.find_all(["a", "script", "link", "iframe"]):
-        href = tag.get("href") or tag.get("src")
-        if not href:
-            continue
-        u = urljoin(base, href)
-        p = urlparse(u)
-        shared["domains"].add(p.netloc)
-        if ALLOWED_DOMAIN and not p.netloc.endswith(ALLOWED_DOMAIN):
-            continue
-        links.add(f"{p.scheme}://{p.netloc}{p.path}")
+        attr = tag.get("href") or tag.get("src")
+        if attr:
+            u = urljoin(base, attr)
+            parsed = urlparse(u)
+            shared["domains"].add(parsed.netloc)
+            if ALLOWED_DOMAIN and parsed.netloc.endswith(ALLOWED_DOMAIN):
+                links.add(f"{parsed.scheme}://{parsed.netloc}{parsed.path}")
+
+    for tag in soup.find_all("script"):
+        src = tag.get("src")
+        if src:
+            full_url = urljoin(base, src)
+            if ALLOWED_DOMAIN in full_url:
+                known_js_paths.setdefault(ALLOWED_DOMAIN, [])
+                if full_url not in known_js_paths[ALLOWED_DOMAIN]:
+                    known_js_paths[ALLOWED_DOMAIN].append(full_url)
+
     return links
 
 
-# --- FETCH ---
-async def fetch(session, url: str):
+def compute_score(parent_e, html, leaks):
+    e_child = shannon_entropy(html)
+    drift = entropy_drift(parent_e, e_child)
+    kcount = sum(html.lower().count(k) for k in KEYWORDS)
+    js_files = html.count(".js")
+    forms = html.count("<form")
+    score = (
+        WEIGHTS["entropy"] * drift
+        + WEIGHTS["keyword"] * kcount
+        + WEIGHTS["leak"] * len(leaks)
+        + WEIGHTS["form"] * forms
+        + WEIGHTS["js"] * js_files
+    )
+    shared["scores_history"][parent_e].append(score)
+    return score, e_child
+
+
+async def fetch_page(session, url):
     async with agent_semaphore:
-        start = time.time()
         try:
-            r = await session.get(url, timeout=10)
-            text = await r.text(errors="ignore")
-            return r.status, text, r.headers, time.time() - start
+            async with session.get(url, timeout=10) as resp:
+                text = await resp.text(errors="ignore")
+                return resp.status, text, resp.headers
         except:
-            return None, "", {}, 0
+            return None, "", {}
 
 
-#RECON AGENT lmo 
-async def agent(name: str, start: str, depth_limit: int):
-    queue = [(start, 0)]
-    async with aiohttp.ClientSession() as ses:
+async def recon_agent(name, start_urls, max_depth):
+    queue = [(u, 0, shannon_entropy("")) for u in start_urls]
+    async with aiohttp.ClientSession() as session:
         while queue:
-            url, depth = queue.pop(0)
-            if depth > depth_limit or url in shared["visited_urls"]:
+            url, depth, parent_e = queue.pop(0)
+            if depth > max_depth or url in shared["visited_urls"]:
                 continue
             shared["visited_urls"].add(url)
-
-            status, body, hdrs, lat = await fetch(ses, url)
-            if status != 200 or not body:
+            status, html, headers = await fetch_page(session, url)
+            if status != 200 or not html:
                 continue
 
-            #  scanning 
-            #  Belo2 scanning features are not the best and still need to be improved esp for large corp. 
-            leaks = scan_secrets(body)
-            if scan_json_structure(body):
-                leaks.append(("JSON", "struct"))
+            leaks = scan_secrets(html, url)
+            keys = scan_json_keys(html)
+            for k in keys:
+                leaks.append(("JSONKey", k))
 
-            # Fuzz GET params
-            fuzz_hits = 0
-            fuzz_details = []
-            if url not in shared["fuzzed_urls"]:
-                p = urlparse(url)
-                qs = parse_qs(p.query)
-                for k in qs:
-                    pl = random.choice(FUZZ_PAYLOADS)
-                    mutated = p._replace(query=urlencode({k: pl}, doseq=True)).geturl()
-                    st2, b2, _, _ = await fetch(ses, mutated)
-                    if st2 == 200 and abs(len(b2) - len(body)) > FUZZ_LENGTH_THRESHOLD:
-                        fuzz_hits += 1
-                        shared["fuzz_success"][pl] += 1
-                        fuzz_details.append((k, pl))
-                        print(f"[FUZZ-GET] {mutated}")
-                shared["fuzzed_urls"].add(url)
-
-            # Fuzz POST forms
-            soup = BeautifulSoup(body, "html.parser")
-            for form in soup.find_all("form"):
-                action = form.get("action") or url
-                action = urljoin(url, action)
-                method = form.get("method", "get").lower()
-                inputs = [
-                    inp.get("name") for inp in form.find_all("input") if inp.get("name")
-                ]
-                for inp_name in inputs:
-                    for pl in FUZZ_PAYLOADS:
-                        if method == "post":
-                            r2 = await ses.post(action, data={inp_name: pl})
-                        else:
-                            r2 = await ses.get(action, params={inp_name: pl})
-                        t2 = await r2.text(errors="ignore")
-                        if (
-                            r2.status == 200
-                            and abs(len(t2) - len(body)) > FUZZ_LENGTH_THRESHOLD
-                        ):
-                            fuzz_hits += 1
-                            shared["fuzz_success"][pl] += 1
-                            fuzz_details.append((f"form:{inp_name}", pl))
-                            print(f"[FUZZ-POST] {action} {inp_name}={pl}")
-
-            # Scoring
-            e = shannon_entropy(body)
-            drift = abs(e - shannon_entropy(""))
-            score = (
-                drift * WEIGHTS["entropy"]
-                + len(leaks) * WEIGHTS["leak"]
-                + sum(body.lower().count(k) for k in KEYWORDS) * WEIGHTS["keyword"]
-                + body.count("<form") * WEIGHTS["form"]
-                + body.count(".js") * WEIGHTS["js"]
-                + fuzz_hits * WEIGHTS["fuzz"]
-            )
+            score, e_child = compute_score(parent_e, html, leaks)
             shared["url_scores"][url] = max(shared["url_scores"].get(url, 0), score)
 
-            # Record leaks
-            for ln, val in leaks:
-                if (url, ln, val) not in shared["leaks_found"]:
-                    shared["leaks_found"].append((url, ln, val))
+            for lname, val in leaks:
+                shared["leaks_found"].append((url, lname, val))
 
-            # Save JSON per-domain
-            d = urlparse(url).netloc
-            od = os.path.join(OUTPUT_DIR, d)
-            os.makedirs(od, exist_ok=True)
-            fn = hashlib.sha1(url.encode()).hexdigest()[:8] + ".json"
-            with open(os.path.join(od, fn), "w") as f:
-                json.dump(
-                    {
-                        "url": url,
-                        "score": score,
-                        "leaks": leaks,
-                        "fuzz_hits": fuzz_details,
-                        "time": lat,
-                    },
-                    f,
-                    indent=2,
-                )
+            print(f"[{name}] D{depth} | {url} | S:{score:.1f} | leaks:{len(leaks)}")
 
-            print(
-                f"[{name}] D{depth}|{url}|S:{score:.1f}|L:{len(leaks)}|F:{fuzz_hits}|t:{lat:.2f}s"
-            )
-
-            # Enqueue children
-            for link in extract_links(body, url):
-                queue.append((link, depth + 1))
+            links = extract_links(html, url)
+            for l in links:
+                queue.append((l, depth + 1, e_child))
 
 
-async def main(tgt: str, agents: int, depth: int):
+def save_output(domain_dir):
+    os.makedirs(domain_dir, exist_ok=True)
+    with open(os.path.join(domain_dir, "urls.txt"), "w") as f:
+        for u in shared["url_scores"]:
+            f.write(u + "\n")
+
+    with open(os.path.join(domain_dir, "domains.txt"), "w") as f:
+        for d in shared["domains"]:
+            f.write(d + "\n")
+
+    with open(os.path.join(domain_dir, f"leaks-{ALLOWED_DOMAIN}.txt"), "w") as f:
+        for url, name, val in shared["leaks_found"]:
+            f.write(f"{url} -> [{name}] {val}\n")
+
+    with open(os.path.join(domain_dir, "api-tokens.json"), "w") as f:
+        json.dump(shared["url_scores"], f)
+
+
+def sig_handler(sig, frame):
+    print("\n✋ Ctrl+C caught — saving output...")
+    domain_dir = os.path.join("output", ALLOWED_DOMAIN)
+    save_output(domain_dir)
+    save_json(KNOWN_JS_PATHS_FILE, known_js_paths)
+    save_json(API_HINTS_FILE, api_hints)
+    exit(0)
+
+
+signal.signal(signal.SIGINT, sig_handler)
+signal.signal(signal.SIGTERM, sig_handler)
+
+
+async def main(target, num_agents, depth):
     global ALLOWED_DOMAIN
-    if not tgt.startswith("http"):
-        tgt = "http://" + tgt
-    ALLOWED_DOMAIN = urlparse(tgt).netloc
-    await asyncio.gather(*[agent(f"A{i+1}", tgt, depth) for i in range(agents)])
+    if not target.startswith("http"):
+        target = "https://" + target
+    ALLOWED_DOMAIN = urlparse(target).netloc
+    domain_dir = os.path.join("output", ALLOWED_DOMAIN)
 
-    # SummaryCSV  urls is here grep for further processing
-    csvf = os.path.join(OUTPUT_DIR, "summary.csv")
-    with open(csvf, "w", newline="") as cf:
-        w = csv.writer(cf)
-        w.writerow(["url", "score", "leaks", "fuzz_hits"])
-        for u, sc in shared["url_scores"].items():
-            ls = [f"{ln}:{v}" for (uu, ln, v) in shared["leaks_found"] if uu == u]
-            fs = [f"{k}({c})" for k, c in shared["fuzz_success"].items()]
-            w.writerow([u, sc, ";".join(ls), ";".join(fs)])
-    print("CSV->", csvf)
+    # Replay known JS
+    js_urls = known_js_paths.get(ALLOWED_DOMAIN, [])
+    print(f"[i] Loaded {len(js_urls)} known JS paths from memory")
+    for js_url in js_urls:
+        shared["visited_urls"].add(js_url)
 
-    # Heatmap for URLs ,
-    segs = defaultdict(list)
-    for u, sc in shared["url_scores"].items():
-        parts = urlparse(u).path.split("/")
-        seg = parts[1] if len(parts) > 1 and parts[1] else "root"
-        segs[seg].append(sc)
-    keys = list(segs.keys())
-    vals = [sum(v) / len(v) for v in segs.values()]
-    plt.figure()
-    plt.bar(keys, vals)
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    hp = os.path.join(OUTPUT_DIR, "heatmap.png")
-    plt.savefig(hp)
-    print("Heatmap->", hp)
-
-    # Domains
-    domf = os.path.join(OUTPUT_DIR, "domains.txt")
-    with open(domf, "w") as df:
-        for d in sorted(shared["domains"]):
-            df.write(d + "\n")
-    print("Domains->", domf)
+    try:
+        await asyncio.gather(
+            *[recon_agent(f"A{i+1}", {target}, depth) for i in range(num_agents)]
+        )
+    finally:
+        save_output(domain_dir)
+        save_json(KNOWN_JS_PATHS_FILE, known_js_paths)
+        save_json(API_HINTS_FILE, api_hints)
+        print(f"\n✅ Recon finished. Output in: {domain_dir}")
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("target")
-    p.add_argument("--agents", type=int, default=MAX_AGENTS)
-    p.add_argument("--depth", type=int, default=DEPTH_LIMIT)
-    a = p.parse_args()
-    asyncio.run(main(a.target, a.agents, a.depth))
+    import argparse
 
-## Todo 
-# 1. Refactor the code to make it more modular and readable as well remove recurring Fuzzing
+    parser = argparse.ArgumentParser(description="⚔️ Infotaxis++ Async Recon")
+    parser.add_argument("target", help="Target domain or IP")
+    parser.add_argument("--agents", type=int, default=MAX_AGENTS)
+    parser.add_argument("--depth", type=int, default=DEPTH_LIMIT)
+    args = parser.parse_args()
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main(args.target, args.agents, args.depth))
